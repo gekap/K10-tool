@@ -348,10 +348,11 @@ class BackupMonitor:
                 if has_active:
                     break
 
-            # Find most recent action
+            # Find most recent action and any skipped/failed within max-age window
             latest_time = ""
             latest_status = ""
             latest_error = ""
+            recent_issues = []  # (time, status, error) for non-Complete within window
 
             for verb in _get_policy_action_verbs(policy):
                 resource = ACTION_VERB_MAP.get(verb, "")
@@ -377,6 +378,19 @@ class BackupMonitor:
                         latest_status = last.get("status", {}).get("state", "Unknown")
                         latest_error = _safe_error_message(last.get("status", {}))
 
+                    # Scan all actions in the window for skipped/failed
+                    for item in action_items:
+                        item_time = item.get("metadata", {}).get("creationTimestamp", "")
+                        if not item_time:
+                            continue
+                        item_age = compute_age(item_time, self._now_epoch)
+                        if item_age is None or item_age > max_age_seconds:
+                            continue
+                        item_state = item.get("status", {}).get("state", "")
+                        if item_state in ("Skipped", "Failed"):
+                            item_err = _safe_error_message(item.get("status", {}))
+                            recent_issues.append((item_time, item_state, item_err))
+
             if not latest_status:
                 latest_status = "\u2014"
 
@@ -384,10 +398,18 @@ class BackupMonitor:
                 latest_status = "Running"
                 latest_error = ""
 
+            # Count recent issues (skipped/failed within window) for separate tracking
+            recent_skipped = sum(1 for _, s, _ in recent_issues if s == "Skipped")
+            recent_failed = sum(1 for _, s, _ in recent_issues if s == "Failed")
+
             # Count by status
             if latest_status == "Complete":
                 count_complete += 1
-                continue
+                if not recent_issues:
+                    continue
+                # Policy recovered but had issues in the window — still show it
+                count_skipped += recent_skipped
+                count_failed += recent_failed
             elif latest_status == "Failed":
                 count_failed += 1
             elif latest_status == "Skipped":
@@ -422,6 +444,14 @@ class BackupMonitor:
             )
             if latest_error:
                 print(f"  error: {latest_error}")
+
+            # Show recent skipped/failed actions within the window
+            if recent_issues and latest_status == "Complete":
+                for issue_time, issue_status, issue_err in sorted(recent_issues):
+                    issue_display = _format_display_time(issue_time)
+                    print(f"  ^ {issue_status} at {issue_display}")
+                    if issue_err:
+                        print(f"    error: {issue_err}")
 
             # Show active actions for this policy
             for action_type in ACTION_TYPES:
